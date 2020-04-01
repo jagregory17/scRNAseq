@@ -1,0 +1,283 @@
+#!/usr/bin/env Rscript
+
+###############################################
+#
+# James Gregory (jgregory@nygenome.org), 
+# analysis of Nan Yang dataset
+###############################################
+
+#clear environment
+rm(list=ls())
+
+#load libraries
+#install.packages('Seurat')
+library(Seurat)
+library(dplyr)
+library(biomaRt)
+library(reshape2)
+library(ggplot2)
+library(ggpubr)
+library(ggfortify)
+
+############################
+## Make a seurat object will all cells that had at least one feature (gene)
+## and the GEM classification
+############################
+
+### 10x data is from two different lanes
+neuron.836 <- Read10X("path.to.data/filtered_feature_bc_matrix") 
+neuron.862 <- Read10X("path.to.data/filtered_feature_bc_matrix")
+
+gem.classifications.862 <- read.csv(file = "/path.to.cell.ranger.output/outs/analysis/gem_classification.csv")
+gem.classifications.862$barcode <- gsub("-1", "", gem.classifications.862$barcode)
+gem.classifications.862$barcode <- paste("862_", gem.classifications.862$barcode, sep = "") # add 862 to barcode labels
+
+gem.classifications.836 <- read.csv("/path.to.cell.ranger.output/outs/analysis/gem_classification.csv")
+gem.classifications.836$barcode <- gsub("-1", "", gem.classifications.836$barcode)
+gem.classifications.836$barcode <- paste("836_", gem.classifications.836$barcode, sep = "") #add 836 to barcode labels
+
+#merge gem classifications
+gem.classifications <- rbind(gem.classifications.836, gem.classifications.862)
+gem.classifications$percent.human <- ((gem.classifications$hg19)/(gem.classifications$hg19 + gem.classifications$mm10))*100
+
+# create seurat objects
+seurat.neuron.836 <- CreateSeuratObject(neuron.836, 
+                                    min.cells = 1,
+                                    min.features = 1,
+                                    project = "836") 
+
+seurat.neuron.862 <- CreateSeuratObject(neuron.862, 
+                                 min.cells = 1,
+                                 min.features = 1,
+                                 project = "862")
+#merge seurat objects. this erases any previous normalization
+neuron_seurat <- merge(seurat.neuron.836, y = seurat.neuron.862, add.cell.ids = c("836", "862"), project = "NanYang")
+RNA.barcodes.836 <- colnames(seurat.neuron.836@assays$RNA@counts) # pull these out to match with hashing later
+RNA.barcodes <- colnames(neuron_seurat@assays$RNA@counts) # get the list of barcodes
+length(RNA.barcodes) == length(unique(RNA.barcodes)) #check that they are the same length
+gem.classifications.ordered <- gem.classifications[match(RNA.barcodes, gem.classifications$barcode),] # order gem classifications to match seurat object
+RNA.barcodes == gem.classifications.ordered$barcode # are they in the right order? should be all trues if so
+
+neuron_seurat <- AddMetaData(neuron_seurat, gem.classifications.ordered$call, col.name = 'classification') # add human vs mouse designation
+neuron_seurat <- AddMetaData(neuron_seurat, gem.classifications.ordered$percent.human, col.name = "percent.human")
+
+#calculate mitochondrial reads
+mito.genes.hg19 <- grep(pattern = "^hg19-MT-", x = rownames(x = neuron_seurat@assays$RNA@data), value = TRUE) #get human mito genes
+mito.genes.mm10 <- grep(pattern = "^mm10-mt-", x = rownames(x = neuron_seurat@assays$RNA@data), value = TRUE) # get mouse mito reads
+gene.list <- rownames(x = neuron_seurat@assays$RNA@data)
+mito.genes <- c(mito.genes.hg19, mito.genes.mm10) # concatentate all mito genes
+percent.mito <- Matrix::colSums(neuron_seurat@assays$RNA@data[mito.genes, ])/Matrix::colSums(neuron_seurat@assays$RNA@data) # calculate percent mito reads
+neuron_seurat <- AddMetaData(object = neuron_seurat, metadata = percent.mito, col.name = "percent.mito") # add mito genes to the meta data
+
+# read in HTO data
+library(Matrix)
+matrix_dir = "/path.to.citeseq.count.data/umi_count"
+barcode.path <- file.path(matrix_dir, "barcodes.tsv.gz")
+features.path <- file.path(matrix_dir, "features.tsv.gz")
+matrix.path <- file.path(matrix_dir, "matrix.mtx.gz")
+mat <- readMM(file = matrix.path)
+feature.names = read.delim(features.path, header = FALSE, stringsAsFactors = FALSE)
+barcode.names = read.delim(barcode.path, header = FALSE, stringsAsFactors = FALSE)
+colnames(mat) = barcode.names$V1
+rownames(mat) = feature.names$V1
+HTO.matrix <- data.matrix(mat, rownames.force = TRUE)
+subset <- HTO.matrix[,1:100]  # view dataframe and check that it's correct
+trans.subset <- t(HTO.matrix)
+
+#plot the distribution of reads per barcode
+HTO.data.frame <- data.frame(t(mat))
+melt.HTO <- melt(HTO.data.frame)
+ggplot(melt.HTO, aes(x=value, fill=variable)) + geom_histogram(binwidth = 1) + xlim(c(0,150))
+
+# get the missing barcodes (i.e. those that do not have HTOs) and make a matrix matching the HTO.matrix
+overlap.HTO.836 <- intersect(rownames(HTO.data.frame), RNA.barcodes.836) # get the matching barcodes 
+HTO.RNA.dif <- setdiff(RNA.barcodes.836, rownames(HTO.data.frame))
+length(overlap.HTO.836)
+
+m <- matrix(0, ncol = length(HTO.RNA.dif), nrow = NROW(HTO.matrix)) # make an empty matrix for the missing barcodes
+dif.hto.dataframe <- data.frame(m)
+colnames(dif.hto.dataframe) <- HTO.RNA.dif
+
+#join the matrices
+total.HTO.matrix <- cbind(HTO.matrix, dif.hto.dataframe)
+
+#get the overlap between RNA barcodes and HTO barcodes
+HTO.RNA.overlap <- intersect(RNA.barcodes.836, colnames(total.HTO.matrix))
+
+#subset the matrix to the barcodes that are present in HTO, RNA, or both
+full.HTO.table <- data.frame(total.HTO.matrix) %>% select(HTO.RNA.overlap)
+
+length(RNA.barcodes.836) == NCOL(full.HTO.table) # true if same number of barcodes
+RNA.barcodes.836 == colnames(full.HTO.table) # true if they are in the same order (rows in gem.classification and columns in HTO)
+test <- full.HTO.table[,1:40] # see what it looks like
+HTO.matrix.ordered <- as.matrix(full.HTO.table + 1)
+#HTO.matrix.ordered <- HTO.matrix.ordered[c(8:13),] #subset so only the desired HTOs are used (e.g. get rid of contaminant HTOs); the ones selected here are the ones used in this 10x experiment
+#HTO.matrix.ordered <- HTO.matrix.ordered[1,] # subset hashtags to the ones you want to use
+hash.IDs <- c("836", "unmapped") # name them
+rownames(HTO.matrix.ordered) <- hash.IDs
+nrow(HTO.matrix.ordered)
+colnames(HTO.matrix.ordered)
+
+neuron_seurat[["HTO"]] <- CreateAssayObject(counts = (HTO.matrix.ordered)) # add hto data as a new assay object
+
+#plot heatmap of HTO counts across all cells
+hto.markers <- FindAllMarkers(neuron_seurat, assay = "HTO", only.pos = TRUE)
+DoHeatmap(neuron_seurat, features = unique(hto.markers$gene), assay = "HTO", angle = 90) + NoLegend()
+
+# get the human gems
+gem.classifications.836.HTO <- read.csv("/gpfs/commons/home/jgregory/10xChromium/NanYang/836_3GEX_NKx2_1_AD_human_Hashing_3GEX/outs/analysis/gem_classification.csv")
+gem.classifications.836.HTO$barcode <- gsub("-1", "", gem.classifications.836.HTO$barcode)
+human.836.gems <- gem.classifications.836.HTO %>% filter(call == "hg19")
+
+HTO.data.frame$barcode <- rownames(HTO.data.frame)
+human.HTO.data.frame <- HTO.data.frame %>% filter(barcode %in% human.836.gems$barcode)
+melt.HTO <- melt(human.HTO.data.frame, measure.vars = colnames(human.HTO.data.frame)[1:2])
+ggplot(melt.HTO, aes(x=value, fill=variable)) + geom_histogram(binwidth = 1) + xlim(c(0,150))
+
+
+
+
+#visualize QC metrics
+VlnPlot(neuron_seurat, features = c("nFeature_RNA", "nCount_RNA", "percent.mito", "percent.human"), ncol = 2)
+#plot1 <- FeatureScatter(neuron_seurat, feature1 = "nCount_RNA", feature2 = "percent.mito", group.by = "hash.ID")
+plot2 <- FeatureScatter(neuron_seurat, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", group.by = "classification")
+plot3 <- FeatureScatter(neuron_seurat, feature1 = "nFeature_RNA", feature2 = "percent.mito", group.by = "classification")
+plot4 <- FeatureScatter(neuron_seurat, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", group.by = "orig.ident")
+plot5 <- FeatureScatter(neuron_seurat, feature1 = "nFeature_RNA", feature2 = "percent.mito", group.by = "orig.ident")
+CombinePlots(plots = list(plot2, plot3, plot4, plot5), ncol = 2)
+
+
+#looking at meta data
+meta.data <- neuron_seurat@meta.data
+meta.data$orig.ident <- factor(meta.data$orig.ident, levels = c("836", "862"))
+ggplot(meta.data, aes(x=orig.ident, fill = classification)) + geom_bar()
+ggplot(meta.data, aes(x=percent.mito, fill = classification)) + geom_histogram(binwidth = 0.01) + facet_grid(~orig.ident)
+meta.data.mouse <- meta.data %>% filter(classification == "mm10")
+ggplot(meta.data.mouse, aes(x=percent.mito, fill = orig.ident)) + geom_histogram(binwidth = 0.01)
+meta.data.human <- meta.data %>% filter(classification == "hg19")
+ggplot(meta.data.human, aes(percent.mito, fill=orig.ident)) + geom_histogram(binwidth = 0.01)
+
+#+ geom_bar(stat = "percent.mito") + geom_text(stat='count', aes(label=..count..), vjust=-1) + theme(axis.text.x = element_text(angle = 90))
+
+#filtering
+neuron_seurat <- subset(neuron_seurat, subset = nFeature_RNA > 50  & percent.mito < 0.5)
+FeatureScatter(neuron_seurat, feature1 = "percent.mito", feature2 = "nFeature_RNA", group.by = "classification")
+
+# process RNA data
+neuron_seurat <- NormalizeData(neuron_seurat, normalization.method = "LogNormalize", scale.factor = 10000) #normalize; 10,000 are lognormalize are the default
+neuron_seurat <- FindVariableFeatures(neuron_seurat, selection.method = "vst", nfeatures = 2000) # vst and 2000 are the default; models the mean variance
+neuron_seurat <- ScaleData(neuron_seurat)
+neuron_seurat <- RunPCA(neuron_seurat, nfeatures.print = 10)
+neuron_seurat <- FindNeighbors(neuron_seurat)
+neuron_seurat <- FindClusters(neuron_seurat)
+neuron_seurat <- RunTSNE(neuron_seurat, check_duplicates = FALSE)
+neuron_seurat.markers <- FindAllMarkers(object = neuron_seurat, max.cells.per.ident = 100, min.diff.pct = 0.3, 
+                                       only.pos = TRUE)
+# write.table(neuron_seurat.markers, file="/gpfs/commons/home/jgregory/10xChromium/NanYang/all.markers.tab", sep = "\t", quote = F, col.names = T, row.names = T)
+# Try UMAP dimensional reduction
+neuron_seurat <- RunUMAP(object = neuron_seurat, assay = "RNA", dims = 1:5)
+
+
+#visualize teh clustering
+VizDimLoadings(neuron_seurat, dims = 1:4, reduction = "pca")
+DimHeatmap(neuron_seurat, cells = 8000, dims = c(1:5), balanced = TRUE)
+
+#Data dimensionality
+ElbowPlot(neuron_seurat)
+neuron_seurat <- JackStraw(neuron_seurat, num.replicate = 100)
+neuron_seurat <- ScoreJackStraw(neuron_seurat, dims = 1:20)
+JackStrawPlot(neuron_seurat, dims = 1:15)
+
+#DimPlot(neuron_seurat, dims = c(1,2), reduction = "pca")
+DimPlot(neuron_seurat, dims = c(1,2), reduction = "umap", group.by = "seurat_clusters")
+DimPlot(neuron_seurat, dims = c(1,2), reduction = "tsne", group.by = "seurat_clusters")
+DimPlot(neuron_seurat, dims = c(1,2), reduction = "tsne", group.by = "classification")
+DimPlot(neuron_seurat, dims = c(1,2), reduction = "tsne", group.by = "orig.ident")
+DimPlot(neuron_seurat, dims = c(1,2), reduction = "tsne", group.by = "percent.mito")
+DimPlot(neuron_seurat, dims = c(1,2), reduction = "tsne", group.by = "percent.human")
+FeaturePlot(neuron_seurat, reduction = "tsne", features = "percent.mito")
+FeaturePlot(neuron_seurat, reduction = "tsne", features = "percent.human")
+
+
+VlnPlot(neuron_seurat, features = c("hg19-TUBA1A", "hg19-NEFL", "hg19-GAD1", "hg19-GAD2", "hg19-DCX", "mm10-Gfap"), group.by = "classification")
+FeaturePlot(neuron_seurat, reduction = "tsne", features = c("hg19-TUBA1A", "hg19-NEFL", "hg19-GAD1", "hg19-GAD2", "hg19-DCX", "mm10-Gfap"))
+
+human <- WhichCells(neuron_seurat, expression = classification %in% c("hg19"))
+human.seurat <- subset(neuron_seurat, cells = human)
+# process RNA data
+human.seurat <- NormalizeData(human.seurat, normalization.method = "LogNormalize", scale.factor = 10000) #normalize; 10,000 are lognormalize are the default
+human.seurat <- FindVariableFeatures(human.seurat, selection.method = "vst", nfeatures = 2000) # vst and 2000 are the default; models the mean variance
+human.seurat <- ScaleData(human.seurat)
+human.seurat <- RunPCA(human.seurat, nfeatures.print = 10)
+human.seurat <- FindNeighbors(human.seurat)
+human.seurat <- FindClusters(human.seurat)
+human.seurat <- RunTSNE(human.seurat, check_duplicates = FALSE)
+human.seurat.markers <- FindAllMarkers(object = human.seurat, max.cells.per.ident = 100, min.diff.pct = 0.3, 
+                                        only.pos = TRUE)
+#write.table(human.seurat.markers, file="/gpfs/commons/home/jgregory/10xChromium/NanYang/human.markers.tab", sep = "\t", quote = F, col.names = T, row.names = T)
+
+# Try UMAP dimensional reduction
+human.seurat <- RunUMAP(object = human.seurat, assay = "RNA", dims = 1:5)
+
+ElbowPlot(human.seurat)
+DimHeatmap(human.seurat, dims = 1:6, cells = 500, balanced = TRUE)
+FeaturePlot(human.seurat, reduction = "tsne", features = c("hg19-SMST", "hg19-ALDH1A1", "hg19-DCX", "hg19-CHAT", "hg19-STMN1", "hg19-GAD1", "hg19-GAD2"))
+FeaturePlot(human.seurat, reduction = "tsne", features = c("hg19-CALB1", "hg19-CALB2", "hg19-SST", "hg19-ISL1", "hg19-SP8", "hg19-NR2F1", "hg19-CTIP2", "hg19-NKX2.1", "hg19-SOX6", "hg19-CHAT"))
+VlnPlot(human.seurat, reduction = "tsne", features = c("hg19-CALB1", "hg19-CALB2", "hg19-SST", "hg19-ISL1", "hg19-SP8", "hg19-NR2F1", "hg19-SOX6"), group.by = "seurat_clusters")
+
+DimPlot(human.seurat, dims = c(1,2), reduction = "umap", group.by = "seurat_clusters")
+DimPlot(human.seurat, dims = c(1,2), reduction = "tsne", group.by = "seurat_clusters")
+DimPlot(human.seurat, dims = c(1,2), reduction = "tsne", group.by = "classification")
+DimPlot(human.seurat, dims = c(1,2), reduction = "tsne", group.by = "orig.ident")
+FeaturePlot(human.seurat, reduction = "tsne", features = "percent.mito")
+
+# let's look for specific genes in the data set
+library(refGenome)
+ens <- ensemblGenome()
+gtf.filepath <- "/gpfs/commons/home/jgregory/Annotations/Genomes/10xChromium/refdata-cellranger-hg19-and-mm10-3.0.0/genes/genes.gtf"
+read.gtf(ens, filename = gtf.filepath, useBasedir = F)
+gene.ids <- ens@ev$genes$gene_id
+gene.names <- ens@ev$genes$gene_name
+test <- grep(pattern = "chat", x = gene.names, value = TRUE, ignore.case = T) #get human mito genes
+
+### looking at enes associated with dissociation
+genes.dissoc <- c("ATF3", "BTG2", "CEBPB", "CEBPD", "CXCL3", "CXCL2", "CXCL1", "DNAJA1", "DNAJB1", "DUSP1", "EGR1", "FOS", "FOSB", "HSP90AA1", "HSP90AB1", "HSPA1A", "HSPA1B", "HSPA1A", "HSPA1B", "HSPA8", "HSPB1", "HSPE1", "HSPH1", "ID3", "IER2", "JUN", "JUNB", "JUND", "MT1X", "NFKBIA", "NR4A1", "PPP1R15A", "SOCS3", "ZFP36")
+genes.dissoc <- paste("hg19-", genes.dissoc, sep = "")
+genes.dissoc.found <- which(rownames(human.seurat@assays$RNA@data) %in% genes.dissoc)
+n.expressed.dissoc.genes <- Matrix::colSums(human.seurat@assays$RNA@data[genes.dissoc.found, ] > 0)
+human.seurat <- AddMetaData(object = human.seurat, metadata = n.expressed.dissoc.genes, col.name = "dissoc.genes")
+
+#### seurat <- ?(?, genes.list = list(?), ctrl.size = 20, enrich.name = "genes_dissoc")
+human.seurat <- AddModuleScore(human.seurat, features = list(genes.dissoc), ctrl.size = 20, name = "genes_dissoc")
+VlnPlot(human.seurat, features = c("nCount_RNA", "nFeature_RNA", "percent.mito", "percent.human", "genes_dissoc1"), group.by = "orig.ident")
+VlnPlot(human.seurat, features = c("dissoc.genes", "genes_dissoc1", "percent.mito", "percent.human"), group.by = "seurat_clusters")
+VlnPlot(human.seurat, features = c("percent.human"), group.by = "seurat_clusters")
+#FeatureScatter(human.seurat, feature1 = "percent.mito", feature2 = "genes_dissoc1", group.by = "seurat_clusters")
+FeatureScatter(human.seurat, feature1 = "genes_dissoc1", feature2 = "percent.mito")
+FeaturePlot(human.seurat, features = c("nCount_RNA", "nFeature_RNA", "percent.mito", "percent.human", "genes_dissoc1"), reduction = "tsne")
+FeaturePlot(human.seurat, reduction = "tsne", features = c("hg19-NEFL", "hg19-GAD1", "hg19-GAD2", "hg19-DCX", "mm10-Gfap"))
+FeaturePlot(human.seurat, reduction = "tsne", features = c("hg19-CALB1", "hg19-CALB2", "hg19-SST", "hg19-PVALB", "hg19-DCX", "hg19-ISL1", "hg19-GAD1", "hg19-GAD2"))
+FeatureScatter(human.seurat, feature1 = "hg19-GAD1", feature2 = "hg19-GAD2", group.by = "orig.ident")
+
+## look at ASD gene list
+library('readxl')
+project <- "/gpfs/commons/home/jgregory/10xChromium/NanYang"
+DNA.file <- "ASDGenes_Expression-averaged-by-celltypes-transpose.xlsx" # DNA filename
+DNA.meta <- read_xlsx(path = file.path(project, DNA.file)) # load file
+ASD.genes <- unique(DNA.meta$Gene)
+hg19.asd.genes <- paste("hg19", ASD.genes, sep = "-")
+
+plotfolder <- file.path(project, "ASD.genes") #designate a path for saving the plots
+for (x in 1:length(hg19.asd.genes)) {
+  tryCatch({ # catch errors for genes that are not detected
+    VlnPlot(human.seurat, features = hg19.asd.genes[x], group.by = "orig.ident")
+    ggsave(filename = file.path(plotfolder, paste(hg19.asd.genes[x], "png", sep = ".")), plot = last_plot())
+  }, error=function(e){})
+}
+
+for (x in 1:length(hg19.asd.genes)) {
+  tryCatch({
+    FeaturePlot(human.seurat, features = hg19.asd.genes[x], reduction = "tsne")
+    ggsave(filename = file.path(plotfolder, paste(hg19.asd.genes[x], "feature.png", sep = ".")), plot = last_plot())
+  }, error=function(e){})
+}
